@@ -1,0 +1,460 @@
+#20220122 RR間隔が2秒以上あれば閾値を変更するように修正
+#20220128 findpeaks_revAの時点で閾値(limit2)廃止　detect_qrs_revAでqrs_act_peaks_values[i]では周囲5ピークで閾値設定　
+import numpy as np
+import pandas as pd
+import matplotlib
+matplotlib.rcParams['agg.path.chunksize'] = 10000
+matplotlib.rcParams['path.simplify_threshold'] = 1.0
+import matplotlib.pyplot as plt
+import csv
+import optuna
+from time import gmtime, strftime
+from scipy.signal import butter, lfilter
+from matplotlib import pyplot as plt
+from scipy.signal import butter, lfilter, filtfilt
+
+"""
+15分用
+
+"""
+#start = 9e+5
+#end = 9.5e+5
+#start = 6.5e+5
+#end = 7.0e+5
+
+#start = 0
+#end = 5e+4
+
+#start = 4.4e+5
+#end = 4.9e+5
+
+start = 8.8e+5
+end = 9.3e+5
+
+
+
+
+"""
+25時間用
+
+"""
+#start = 0
+#end = 1e+5
+
+#start = 2.16e+7
+#end = 2.17e+7
+
+#start = 4.32e+7
+#end = 4.33e+7
+
+#start = 6.48e+7
+#end = 6.49e+7
+
+file_number = '20210812'
+LOG_DIR = r"C:\Users\QT001\Downloads\{}\logs".format(file_number)
+PLOT_DIR = r"C:\Users\QT001\Downloads\{}\plots".format(file_number)
+
+
+class QRSDetectorOffline(object):
+
+    def __init__(self, ecg_data, ecg_data_path=None, verbose=True, log_data=False, plot_data=False, show_plot=False):
+        # Configuration parameters.
+        self.ecg_data_path = ecg_data_path
+        self.plot_path = None
+
+        self.signal_frequency = 1000 # Set ECG device frequency in samples per second here.
+        #-------Lowpass Filter用変数--------------
+        self.filter_lowcut = 0.0
+        self.filter_highcut = 60.0
+        self.filter_order =1
+        # ----------detect_peaks関数用--------------------------
+        self.integration_window = 120    #微分2乗の移動平均用 もとは15
+        self.integration_window_detectPeak = 240  #移動平均算出用 もとは30
+        # -------Lowpass Filter用変数--------------
+        self.findpeaks_limit = 0.1
+        self.findpeaks_spacing = 50   #trial.suggest_int('findpeaks_spacing',)       #もとは25　ピーク検出の時に窓の中央が最大なものを探すときの窓サイズ。あまりいじる必要ない？
+        self.thershold_coeff_findpeaks = 1.0 #もとは0.4
+        # -------detect_qrs_revA関数用--------------
+        self.refractory_period = 40   #QRSから次のQRSまで もとは30
+        self.threshold_coeff = 0.8  #QRSと認識されるための最小振幅 tmp_threshould(=直近5ピークの平均値)にかけて閾値を設定
+        # ------------------------------------
+        # Loaded ECG data.vv                       
+        self.ecg_data_raw = ecg_data
+
+        # Measured and calculated values.
+        self.filtered_ecg_measurements = None
+        self.differentiated_ecg_measurements = None
+        self.squared_ecg_measurements = None
+        self.integrated_ecg_measurements = None
+        self.detected_peaks_indices = None
+        self.detected_peaks_values = None
+
+        self.qrs_peak_value = 0.0
+        self.noise_peak_value = 0.0
+        self.threshold_value = 0.0
+        self.threshold_value_change_coeff = 0.90 #元は0.5
+        self.average_act_peaks_values=0.0
+        self.integrated_ecg_measurements_threshold=0.0
+
+        # Detection results.
+        self.qrs_peaks_indices = np.array([], dtype=int)
+        self.ecg_measurements_peaks_values = np.array([], dtype=int)
+        self.qrs_act_peaks_values = np.array([], dtype=int)
+        self.noise_peaks_indices = np.array([], dtype=int)
+
+        # Final ECG data and QRS detection results array - samples with detected QRS are marked with 1 value.
+        self.ecg_data_detected = None
+        #-------20220623追加 butter worth(highpass filter)
+        self.butter_order = 4
+        self.butter_cutoff=0.02
+
+        """
+        # length of qrs_peaks_indices
+        self.len_qrs_peaks = len(self.qrs_peaks_indices)
+
+        """
+
+
+    def detect(self,verbose=True, log_data=False, plot_data=False, show_plot=False):
+        # Run whole detector flow.
+       # self.load_ecg_data()
+        self.detect_peaks()
+       # self.detect_qrs()
+        # 20210805
+        self.detect_qrs_revA()
+
+        if verbose:
+            self.print_detection_data()
+
+        if log_data:
+            self.log_path = "{:s}QRS_offline_detector_log_{:s}.csv".format(LOG_DIR,
+                                                                           strftime("%Y_%m_%d_%H_%M_%S", gmtime()))
+            self.log_detection_data()
+
+        if plot_data:
+        #    self.plot_path = "{:s}QRS_offline_detector_plot_{:s}.png".format(PLOT_DIR,
+        #                                                                     strftime("%Y_%m_%d_%H_%M_%S", gmtime()))
+            self.plot_detection_data(show_plot=show_plot)
+        
+    """Loading ECG measurements data methods."""
+
+    def load_ecg_data(self):
+        """
+        Method loading ECG data set from a file.
+        """
+        self.ecg_data_raw = np.loadtxt(self.ecg_data_path, skiprows=1, delimiter=',')
+
+    """ECG measurements data processing methods."""
+
+    def detect_peaks(self):
+        """
+        Method responsible for extracting peaks from loaded ECG measurements data through measurements processing.
+        """
+        # Extract measurements from loaded ECG data.
+        
+        ecg_measurements = self.ecg_data_raw[:, 1]
+        #print(ecg_measurements)
+
+
+        # Measurements filtering - 0-15 Hz band pass filter.
+        #self.filtered_ecg_measurements = self.bandpass_filter(ecg_measurements, lowcut=self.filter_lowcut,
+        #                                                      highcut=self.filter_highcut, signal_freq=self.signal_frequency,
+        #                                                       filter_order=self.filter_order)
+        self.filtered_ecg_measurements = self.butter_highpass_filter(ecg_measurements, self.butter_order, self.butter_cutoff)
+        ######### 移動平均を計算 2021/06中山追加#########
+        self.convolve_ecg_measurements = np.convolve(self.filtered_ecg_measurements,
+                                                     np.ones(self.integration_window_detectPeak) / self.integration_window_detectPeak)  # 移動平均
+        # ずれを修正
+        self.convolve_ecg_measurements = self.convolve_ecg_measurements[int((self.integration_window_detectPeak - 1) / 2):-int((self.integration_window_detectPeak - 1) / 2)-1]  # integrationによる遅れを補正
+        ###########################################
+
+        self.filtered_ecg_measurements[:5] = self.filtered_ecg_measurements[5]
+
+        # Derivative - provides QRS slope information.
+        self.differentiated_ecg_measurements = np.ediff1d(self.filtered_ecg_measurements)
+
+        # Squaring - intensifies values received in derivative.
+        self.squared_ecg_measurements = self.differentiated_ecg_measurements ** 2
+
+        # Moving-window integration.
+        self.integrated_ecg_measurements = np.convolve(self.squared_ecg_measurements, np.ones(self.integration_window))#移動平均
+        self.integrated_ecg_measurements = self.integrated_ecg_measurements[int((self.integration_window-1)/2):] #integrationによる遅れを補正
+        
+        # Fiducial mark - peak detection on integrated measurements.
+        #20210805
+        self.detected_peaks_indices = self.findpeaks_revA(data=self.integrated_ecg_measurements,
+                                                   limit=self.findpeaks_limit,
+                                                    spacing=self.findpeaks_spacing)
+        #peakのadjust
+        #20210820
+        self.adjust_peak_indices()
+        self.detected_peaks_values = self.integrated_ecg_measurements[self.detected_peaks_indices]
+
+    
+    """Results reporting methods."""
+
+    def print_detection_data(self):
+        """
+        Method responsible for printing the results.
+        """
+        
+        print("qrs peaks indices")
+        print(self.qrs_peaks_indices)
+        print("noise peaks indices")
+        print(self.noise_peaks_indices)
+
+    def log_detection_data(self):
+        """
+        Method responsible for logging measured ECG and detection results to a file.
+        """
+        measurement_qrs_detection_flag = np.zeros([len(self.ecg_data_raw[:, 1]), 1])
+        measurement_qrs_detection_flag[self.qrs_peaks_indices] = 1
+        self.ecg_data_detected = np.append(self.ecg_data_raw, measurement_qrs_detection_flag, 1)
+        
+        with open(self.log_path, "wb") as fin:
+            fin.write(b"timestamp,ecg_measurement,qrs_detected\n")
+       #     self.ecg_data_detected = np.array(self.ecg_data_detected).reshape(-1)
+            np.savetxt(fin, self.ecg_data_detected, delimiter=",")
+        
+        """"
+        indice_in_range = []
+        for indice in self.qrs_peaks_indices:
+            if 8900000 <= indice <= 9000000:
+                indice_in_range.append(indice)
+
+        rr_intervals = np.diff(indice_in_range)
+        r_peaks_values = self.ecg_data_detected[indice_in_range, 1]
+        print('len r_peaks_values : {}'.format(len(r_peaks_values)))
+                
+        if len(rr_intervals) != len(r_peaks_values):
+            if len(rr_intervals) < len(r_peaks_values):
+                rr_intervals = np.concatenate((rr_intervals, [np.nan] * (len(r_peaks_values) - len(rr_intervals))))
+           else:
+                r_peaks_values = np.concatenate((r_peaks_values, [np.nan] * (len(rr_intervals) - len(r_peaks_values))))
+
+    # RR間隔とR波のピーク値をCSVに出力
+        refractory_period_list = [self.refractory_period]*len(rr_intervals)
+        threshold_coeff_list = [self.threshold_coeff]*len(rr_intervals)
+        findpeaks_spacing_list = [self.findpeaks_spacing]*len(rr_intervals)
+        thershold_coeff_findpeaks_list = [self.thershold_coeff_findpeaks]*len(rr_intervals)
+        threshold_value_change_coeff_list = [self.threshold_value_change_coeff]*len(rr_intervals)
+        findpeaks_limit_list = [self.findpeaks_limit]*len(rr_intervals)
+        integration_window_list = [self.integration_window]*len(rr_intervals)
+        integration_window_detectPeak_list = [self.integration_window_detectPeak]*len(rr_intervals)
+
+        df = pd.DataFrame({
+
+            'RR Intervals': rr_intervals,
+            'R Peaks': r_peaks_values,
+            'integration_window':integration_window_list,
+            'integration_window_detectPeak':integration_window_detectPeak_list,
+            'refractory_period':refractory_period_list,
+            'threshold_coeff':threshold_coeff_list,
+            'findpeaks_spacing':findpeaks_spacing_list,
+            'threshold_coeff_findpeaks':thershold_coeff_findpeaks_list,
+            'threshold_value_change_coeff':threshold_value_change_coeff_list,
+            'findpeaks_limit':findpeaks_limit_list
+            
+            })
+        df.to_csv("{:s}rr_interval_peaks_log{:s}.csv".format(LOG_DIR,strftime("%Y_%m_%d_%H_%M_%S", gmtime())))
+
+        #with open("{:s}rr_interval_peaks_log{:s}.csv".format(LOG_DIR,strftime("%Y_%m_%d_%H_%M_%S", gmtime())), 'w', newline='') as f:
+        #    writer = csv.writer(f)
+        #    writer.writerow(['RR Intervals', 'R Peaks','refractory_period', 'threshold_coeff'])
+        #    for rr, rp, rp_val, tc_val in zip(rr_intervals, r_peaks_values, refractory_period_list, threshold_coeff_list):
+        #        writer.writerow([rr, rp, rp_val, tc_val])
+        #    writer.writerows(zip(rr_intervals, r_peaks_values, self.refractory_period, self.threshold_coeff))
+"""
+
+    def plot_detection_data(self, show_plot=True):
+        """
+        Method responsible for plotting detection results.
+        :param bool show_plot: flag for plotting the results and showing plot
+        """
+
+        
+
+        def plot_data(axis, data, title='', fontsize=10, x_min=start, x_max = end, y_min=0, y_max=10):
+            axis.set_title(title, fontsize=fontsize)
+            axis.grid(which='both', axis='both', linestyle='--')
+            axis.plot(data, color="salmon", zorder=1)
+            axis.set_xlim([x_min,x_max])
+            axis.set_ylim([y_min,y_max])
+            
+
+        def plot_points(axis, values, indices, x_min=start, x_max = end, y_min=0, y_max=10):
+            axis.scatter(x=indices, y=values[indices], c="black", s=10, zorder=2)
+            axis.set_xlim([x_min,x_max])
+            axis.set_ylim([y_min,y_max])
+        
+      #  ranges = [(i, i + 100000) for i in range(0, 100000, 100000)]
+      #  for start, end in ranges:
+
+
+        plt.close('all')
+        fig, axarr = plt.subplots(6, sharex=True, figsize=(15, 18))
+        plot_data(axis=axarr[0], data=self.ecg_data_raw[:, 1], title='Raw ECG measurements', x_min=start, x_max = end ,y_min=-15, y_max=15) #, y_min=-5, y_max=5
+        plot_data(axis=axarr[1], data=self.filtered_ecg_measurements, title='Filtered ECG measurements',x_min=start, x_max = end, y_min=-10, y_max=10) # y_min=-5, y_max=5
+        plot_data(axis=axarr[2], data=self.differentiated_ecg_measurements, title='Differentiated ECG measurements',x_min=start, x_max = end, y_min=-5, y_max=5) # y_min=-2.5, y_max=2.5
+        plot_data(axis=axarr[3], data=self.squared_ecg_measurements,title='Squared ECG measurements',x_min=start, x_max = end, y_min=0, y_max=20) #y_min=0, y_max=10
+        plot_data(axis=axarr[4], data=self.integrated_ecg_measurements, title='Integrated ECG measurements with QRS peaks marked (black)',x_min=start, x_max = end, y_min=0, y_max=75) 
+        plot_points(axis=axarr[4], values=self.integrated_ecg_measurements, indices=self.qrs_peaks_indices,x_min=start, x_max = end, y_min=0, y_max=75)
+        plot_data(axis=axarr[5], data=self.ecg_data_detected[:, 1], title='Raw ECG measurements with QRS peaks marked (black)')
+        plot_points(axis=axarr[5], values=self.ecg_data_detected[:, 1], indices=self.qrs_peaks_indices,x_min=start, x_max = end, y_min=-15, y_max=15)
+
+        plt.tight_layout()
+        FIG_PATH = PLOT_DIR + '{}_{}.png'.format(start,end)
+        fig.savefig(FIG_PATH)
+
+        if show_plot:
+            plt.show()
+
+        plt.close()
+
+    """Tools methods."""
+
+
+    def findpeaks_revA(self, data, spacing=1, limit=None):
+        lengthData = data.size
+        x = np.zeros(lengthData + 2 * spacing)
+        x[:spacing] = data[0] - 1.e-6
+        x[-spacing:] = data[-1] - 1.e-6
+        x[spacing:spacing + lengthData] = data
+        # np.set_printoptions(threshold=np.inf)
+        peak_candidate = np.zeros(lengthData)
+        peak_candidate[:] = True #一旦すべてpeakの候補とする
+
+        for s in range(spacing):
+            start = spacing - s - 1
+            h_b = x[start: start + lengthData]  # before
+            start = spacing
+            h_c = x[start: start + lengthData]  # central　これが前後より大きいならpeak
+            start = spacing + s + 1
+            h_a = x[start: start + lengthData]  # after
+            peak_candidate = np.logical_and(peak_candidate, np.logical_and(h_c > h_b, h_c > h_a)) #窓中央のデータ点が最大の時peak
+
+        ind = np.argwhere(peak_candidate)
+        ind = ind.reshape(ind.size)
+        #if limit is not None:
+        #    ind = ind[data[ind] > limit]
+        
+        ###################中山追加 20210708#########
+        #ピークの平均を追加
+
+        limit2=np.median(self.integrated_ecg_measurements[ind])*self.thershold_coeff_findpeaks
+        if limit2 is not None:
+            ind = ind[data[ind] > limit2]
+        ##書き出し用
+        self.integrated_ecg_measurements_threshold = limit2
+        #############################################
+        return ind
+
+    ###################中山作成###################
+    def detect_qrs_revA(self):
+        ####移動平均値とpeak値の差分値をrevisedPeakとして扱う。
+        #移動平均値
+        self.convolve_values = self.convolve_ecg_measurements[self.detected_peaks_indices]
+        #originalデータのピーク値
+        self.ecg_measurements_peaks_values =self.ecg_data_raw[:, 1][self.detected_peaks_indices]
+        # 評価対象(originalデータのピーク値-移動平均値)
+        self.qrs_act_peaks_values = abs(self.ecg_measurements_peaks_values - self.convolve_values)
+        # 評価対象(originalデータのピーク値-移動平均値)の平均値
+        #self.average_act_peaks_values=self.qrs_act_peaks_values.mean()
+        #判定基準値は、対象ブロックでの平均値＊係数
+        #self.threshold_value =self.average_act_peaks_values*self.threshold_coeff
+        #1度目のフィルタ
+        self.filter_peaks()
+        print('qrs_act_peaks_values')
+        print(self.qrs_act_peaks_values)
+
+    #----------20220121 中山追加　RR間隔が2秒以上では閾値を下げて再処理。-----------
+        #RR間隔が2秒以上あれば、フィルタの閾値を変更して再度検出
+        
+        """
+        print('diff qrs_peaks_indices')
+        print(np.diff(self.qrs_peaks_indices))
+
+        """
+
+        if np.any(np.diff(self.qrs_peaks_indices) >2*self.signal_frequency) :  #配列に2秒以上が含まれるかどうか。
+            self.threshold_coeff =self.threshold_coeff *self.threshold_value_change_coeff #閾値の再設定
+            self.qrs_peaks_indices= np.array([], dtype=int) #配列の初期化
+            self.filter_peaks()
+
+    def filter_peaks(self):
+       
+        #tmp_thresholdの仮値設定
+        if len(self.qrs_act_peaks_values)>0 and len(self.qrs_act_peaks_values)<5:
+         tmp_threshold = sum(self.qrs_act_peaks_values)/len(self.qrs_act_peaks_values)
+        elif len(self.qrs_act_peaks_values)>=5:
+         tmp_threshold=sum(self.qrs_act_peaks_values[0:5])/5
+        else:#len(self.qrs_act_peaks_values)=0の場合
+         tmp_threshold=0
+        tmp_threshold=tmp_threshold*self.threshold_coeff
+        #前後2ピークずつ（計5つ）で閾値を設定
+        if len(self.detected_peaks_indices)>5:
+         for i in range(len(self.detected_peaks_indices)):
+            if i>2 and i+3<len(self.detected_peaks_indices):
+                tmp_threshold=sum(self.qrs_act_peaks_values[i-2:i+3])/5
+                tmp_threshold =tmp_threshold*self.threshold_coeff
+            try:
+                last_qrs_index = self.qrs_peaks_indices[-1]
+            except IndexError:
+                last_qrs_index = 0
+            # 判定基準1よこ間隔
+            if (self.detected_peaks_indices[
+                    i] - last_qrs_index) > self.refractory_period or not self.qrs_peaks_indices.size:
+
+                # 判定基準2　縦のピーク値
+                if self.qrs_act_peaks_values[i] > tmp_threshold:
+                    self.qrs_peaks_indices = np.append(self.qrs_peaks_indices, self.detected_peaks_indices[i])
+
+
+    # -----------20220121-----------------------------------------------------------
+
+    def adjust_peak_indices(self):
+        # peak補正
+        ecg_measurements = self.ecg_data_raw[:, 1]
+        corrected_rr_indices=[]
+        for idx in self.detected_peaks_indices:
+            if idx<20:
+             target = abs(ecg_measurements[0:idx + 20]-self.convolve_ecg_measurements[0:idx + 20])
+             max_idx = np.argmax(target)
+             corrected_rr_indices.append(max_idx)
+            else:
+             target = abs(ecg_measurements[idx - 20:idx + 20]-self.convolve_ecg_measurements[idx - 20:idx + 20])
+             max_idx = np.argmax(target)
+             corrected_rr_indices.append(idx - 20 + max_idx)
+
+        self.detected_peaks_indices=corrected_rr_indices
+    # -----------ハイパスフィルタ　20220623追加-----------------------------------------------------------
+    def butter_highpass_filter(self,data, order, normal_cutoff):
+        normal_cutoff
+        b, a = butter(order, normal_cutoff, btype='high', analog=False)
+        y = filtfilt(b, a, data)
+        return y
+    
+
+
+
+
+
+
+
+if __name__ == "__main__":
+   
+     # Define file path
+    file_path = r"C:\Users\QT001\Downloads\{}\{}.ascii".format(file_number,file_number)
+    data_start_row = 28
+    ecg_data = pd.read_csv(file_path, delimiter="\t", skiprows=data_start_row, header=None, names=['Time', 'EC'])
+     # Convert the data to numpy array
+    ecg_data_array = np.array(ecg_data.loc[:,('Time', 'EC')])
+   
+     # Initialize QRSDetectorOffline
+    qrs_detector = QRSDetectorOffline(ecg_data=ecg_data_array,ecg_data_path=r"C:\Users\QT001\Downloads\20220629_No2\20220629_No2.ascii", verbose=True,
+                                      log_data=True, plot_data=True, show_plot=True)
+                                      
+    qrs_detector.signal_frequency = 1000  
+    qrs_detector.detect(verbose=True,log_data=True, plot_data=True, show_plot=True)    
+        
+        
